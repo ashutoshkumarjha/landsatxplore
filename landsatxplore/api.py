@@ -10,9 +10,9 @@ import time
 
 import requests
 from shapely.geometry import Point, shape
-
+from landsatxplore.util import is_display_id,is_entity_id
 from landsatxplore.errors import USGSAuthenticationError, USGSError, USGSRateLimitError
-
+from landsatxplore.util import guess_dataset
 
 API_URL = "https://m2m.cr.usgs.gov/api/api/json/stable/"
 
@@ -273,6 +273,145 @@ class API(object):
         )
         return [_parse_metadata(scene) for scene in r.get("results")]
 
+    def get_products_download_options(self,entityList,filetype,datasetName=None,idField="displayId"):
+        entityIdsinFile = {}
+        finalDownload = []
+        # Add scenes to a list
+        listname=_random_string()
+
+        for entity in entityList:
+            entitykey=entity.strip().encode("ascii", "ignore").decode()
+            #If datasetName is not given guess it
+            if not datasetName :
+                datasetName=guess_dataset(entitykey) 
+
+            if is_display_id(entitykey):
+               idField="displayId" 
+            elif is_entity_id(entitykey):
+               idField="entityId"
+            else:
+                raise USGSError(
+                "Entity is neither displayId or entityId :{} not found.".format(entitykey)) 
+
+            listId = f"temp_{datasetName}_{listname}_list" # customized list id
+            payload = {
+                "listId": listId,
+                "idField" : idField,
+                "datasetName": datasetName
+            }
+
+            payloadkey=json.dumps(payload)
+            if payloadkey in entityIdsinFile.keys() :
+                entityIdsinFile[payloadkey].append(entitykey) 
+            else :
+                entityIdsinFile[payloadkey]=[entitykey]
+            
+
+        for payloadkey in entityIdsinFile.keys(): 
+            
+            payload=json.loads(payloadkey)
+            payload["entityIds"]=entityIdsinFile[payloadkey]
+
+            self.request("scene-list-add",params=payload)
+
+            # Get download options
+            payload = {
+                "listId": listId,
+                "datasetName": datasetName
+            }
+
+            products=self.request("download-options",params=payload)
+
+           # Select products
+            downloads = []
+            if filetype == 'bundle':
+                # select bundle files
+                for product in products:        
+                    if product["bulkAvailable"]:               
+                        downloads.append({"entityId":product["entityId"], "productId":product["id"]})
+            elif filetype == 'band':
+                # select band files
+                for product in products:  
+                    if product["secondaryDownloads"] is not None and len(product["secondaryDownloads"]) > 0:
+                        for secondaryDownload in product["secondaryDownloads"]:
+                            if secondaryDownload["bulkAvailable"]:
+                                downloads.append({"entityId":secondaryDownload["entityId"], "productId":secondaryDownload["id"]})
+            else:
+                # select all available files
+                for product in products:        
+                    if product["bulkAvailable"]:               
+                        downloads.append({"entityId":product["entityId"], "productId":product["id"]})
+                    if product["secondaryDownloads"] is not None and len(product["secondaryDownloads"]) > 0:
+                        for secondaryDownload in product["secondaryDownloads"]:
+                            if secondaryDownload["bulkAvailable"]:
+                                downloads.append({"entityId":secondaryDownload["entityId"], "productId":secondaryDownload["id"]})
+            # Remove the list
+            payload = {
+                "listId": listId
+            }
+            self.request("scene-list-remove",params=payload)
+            finalDownload=finalDownload+downloads
+
+        return finalDownload
+          
+    def get_download_urls(self,downloads):
+            # Send download-request
+        productURLs=[]
+        label = datetime.now().strftime("%Y%m%d_%H%M%S") # Customized label using date time
+        payload = {
+            "downloads": downloads,
+            "label": label,
+            'returnAvailable': True
+        }
+        
+        #print(f"Sending download request ...\n")
+        results = self.request("download-request", params=payload)
+        #print(f"Done sending download request\n") 
+
+          
+        for result in results['availableDownloads']:       
+            #print(f"Get download url: {result['url']}\n" )
+            productURLs.append(result['url'])
+            #runDownload(threads, result['url'])
+
+        preparingDownloadCount = len(results['preparingDownloads'])
+        preparingDownloadIds = []
+        if preparingDownloadCount > 0:
+            for result in results['preparingDownloads']:  
+                preparingDownloadIds.append(result['downloadId'])
+      
+            payload = {"label" : label}                
+            # Retrieve download urls
+            #print("Retrieving download urls...\n")
+            results = self.request("download-retrieve", params=payload)
+            if results != False:
+                for result in results['available']:
+                    if result['downloadId'] in preparingDownloadIds:
+                        preparingDownloadIds.remove(result['downloadId'])
+                        #print(f"Get download url: {result['url']}\n" )
+                        productURLs.append(result['url'])
+                        #runDownload(threads, result['url'])
+                    
+                for result in results['requested']:   
+                    if result['downloadId'] in preparingDownloadIds:
+                        preparingDownloadIds.remove(result['downloadId'])
+                        #print(f"Get download url: {result['url']}\n" )
+                        productURLs.append(result['url'])
+                        #runDownload(threads, result['url'])
+            
+            # Don't get all download urls, retrieve again after 30 seconds
+            while len(preparingDownloadIds) > 0: 
+                print(f"{len(preparingDownloadIds)} downloads are not available yet. Waiting for 30s to retrieve again\n")
+                time.sleep(30)
+                results =  self.request("download-retrieve",params=payload)
+                if results != False:
+                    for result in results['available']:                            
+                        if result['downloadId'] in preparingDownloadIds:
+                            preparingDownloadIds.remove(result['downloadId'])
+                            #print(f"Get download url: {result['url']}\n" )
+                            productURLs.append(result['url'])
+                            #runDownload(threads, result['url'])
+        return productURLs
 
 def _random_string(length=10):
     """Generate a random string."""

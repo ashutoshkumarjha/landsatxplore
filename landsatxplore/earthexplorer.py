@@ -5,7 +5,9 @@ import re
 
 import requests
 from tqdm import tqdm
-
+import random
+import string
+import threading
 from landsatxplore.api import API
 from landsatxplore.errors import EarthExplorerError
 from landsatxplore.util import guess_dataset, is_display_id
@@ -17,6 +19,7 @@ EE_LOGOUT_URL = "https://earthexplorer.usgs.gov/logout"
 EE_DOWNLOAD_URL = (
     "https://earthexplorer.usgs.gov/download/{data_product_id}/{entity_id}/EE/"
 )
+
 
 # IDs of GeoTIFF data product for each dataset
 DATA_PRODUCTS = {
@@ -30,6 +33,12 @@ DATA_PRODUCTS = {
     "landsat_etm_c2_l2": "5e83d12aada2e3c5",
     "landsat_ot_c2_l2": "5e83d14f30ea90a9",
     "sentinel_2a": "5e83a42c6eba8084",
+}
+
+FILETYPES = {
+    'bundle':0,
+    'band':1,
+    'all':3
 }
 
 
@@ -54,6 +63,9 @@ class EarthExplorer(object):
         self.session = requests.Session()
         self.login(username, password)
         self.api = API(username, password)
+        self.maxthreads = 5 # Threads count for downloads
+        self.sema = threading.Semaphore(value=self.maxthreads)
+        self.threads = []
 
     def logged_in(self):
         """Check if the log-in has been successfull based on session cookies."""
@@ -149,3 +161,131 @@ class EarthExplorer(object):
         )
         filename = self._download(url, output_dir, timeout=timeout, skip=skip)
         return filename
+
+    def resume_download(self,output_dir,timeout,chunk_size,skip,download_url):
+        self.sema.acquire() 
+        try:
+            with self.session.get(
+                download_url, stream=True, allow_redirects=True, timeout=timeout
+            ) as rh:
+                file_size = int(rh.headers.get("Content-Length",0))
+                local_filename = rh.headers["Content-Disposition"].split("=")[-1]
+                local_filename = local_filename.replace('"', "")
+                if local_filename.endswith('tar'):
+                    local_filename=local_filename+".gz"
+                local_filename = os.path.join(output_dir, local_filename)
+                resume_byte_pos=self.checkFileSize(local_filename)
+                initial_pos = resume_byte_pos if resume_byte_pos else 0
+                mode = 'ab' if resume_byte_pos else 'wb' 
+                resume_header = ({'Range': f'bytes={resume_byte_pos}-'} if resume_byte_pos else None)
+                with self.session.get(
+                    download_url, stream=True, allow_redirects=True, timeout=timeout, headers=resume_header
+                ) as r:
+                    with open(local_filename, mode) as f:
+                        with tqdm(total=file_size, unit='B',unit_scale=True, unit_divisor=1024,desc=local_filename, 
+                                    initial=initial_pos, miniters=1) as pbar:
+                            for chunk in r.iter_content(chunk_size=chunk_size):
+                                if chunk:
+                                    f.write(chunk)
+                                    pbar.update(chunk_size)
+            self.sema.release()
+        except requests.exceptions.Timeout:
+            raise EarthExplorerError(
+                "Connection timeout after {} seconds.".format(timeout)
+            )
+            self.sema.release()
+            self.runDownloadMultiThread(threads, output_dir, timeout, chunk_size, skip, download_url)
+        return local_filename
+
+    def checkFileSize(self,local_filename):
+        if os.path.isfile(local_filename):
+            return os.stat(local_filename).st_size
+        return None
+
+    def _downloadFileMultiThread(self,output_dir,timeout,chunk_size,skip,download_url):
+        self.sema.acquire()
+        local_filename=None
+        try:
+            with self.session.get(
+                download_url, stream=True, allow_redirects=True, timeout=timeout
+            ) as r:
+                file_size = int(r.headers.get("Content-Length"))
+                with tqdm(
+                    total=file_size, unit_scale=True, unit="B", unit_divisor=1024
+                ) as pbar:
+                    local_filename = r.headers["Content-Disposition"].split("=")[-1]
+                    local_filename = local_filename.replace('"', "")+".gz"
+                    local_filename = os.path.join(output_dir, local_filename)
+                    if skip:
+                        return local_filename
+                    with open(local_filename, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=chunk_size):
+                            if chunk:
+                                f.write(chunk)
+                                pbar.update(chunk_size)
+            self.sema.release()
+        except requests.exceptions.Timeout:
+            raise EarthExplorerError(
+                "Connection timeout after {} seconds.".format(timeout)
+            )
+            self.sema.release()
+            self.runDownloadMultiThread(threads, output_dir, timeout, chunk_size, skip, download_url)
+        return local_filename
+  
+    def runDownloadMultiThread(self,threads, output_dir,timeout,chunk_size,skip,url):
+        #thread = threading.Thread(target=self._downloadFileMultiThread, args=(output_dir,timeout,chunk_size,skip,url,))
+        thread = threading.Thread(target=self.resume_download, args=(output_dir,timeout,chunk_size,skip,url,))
+        self.threads.append(thread)
+        thread.start()
+
+    def downloadbulk(self,entityfile, output_dir,dataset=None, filetype="bundle",idField="displayId",timeout=300, chunk_size=1024,skip=False):
+        """Download a Landsat scene.
+
+        Parameters
+        ----------
+        entityfile : str
+            Scene Entity ID or Display ID File Containing their entries.
+        dataset : str, optional
+                    Dataset name. If not provided, automatically guessed from scene id.
+        output_dir : str
+            Output directory. Automatically created if it does not exist.
+        filetype : str 
+            File type as 'bundle' or 'bandd' for individual files 
+        idFiled : str
+            Files contains the 'entityId' or 'displayId'
+        timeout : int, optional
+            Connection timeout in seconds.
+        skip : bool, optional
+            Skip download, only returns the remote filename list.
+
+        Returns
+        -------
+        filename : str
+            Path to downloaded file.
+        """
+
+        try:
+            with open(entityfile, 'r') as f:
+                entityList = f.readlines()   
+            if(len(entityList)<1):
+                raise EarthExplorerError(
+                    "Entity File:{entityfile} is Empty.".format(entityfile)
+                )
+        except FileNotFoundError as e:
+            raise EarthExplorerError(
+                "Entity File:{entityfile} not found.".format(entityfile)
+            )
+        productsdownloads=self.api.get_products_download_options(entityList=entityList,filetype=filetype,datasetName=dataset,idField=idField)
+        #print(productsdownloads)
+        productsUrls=self.api.get_download_urls(productsdownloads)
+        if skip :
+            return productsUrls
+        #print(productsUrls)
+        for productsUrl in productsUrls:
+            self.runDownloadMultiThread(self.threads, output_dir,timeout,chunk_size,skip,productsUrl) 
+
+        print("Download Started\n")
+        for thread in self.threads:
+            thread.join()
+
+

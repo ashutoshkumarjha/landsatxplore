@@ -156,7 +156,7 @@ def download(username, password, dataset, output, timeout, skip, scenes):
     """Download one or several scenes."""
     ee = EarthExplorer(username, password)
     output_dir = os.path.abspath(output)
-    if dataset and dataset not in DATASETS:
+    if dataset and dataset.lower() not in DATASETS:
         raise LandsatxploreError(f"`{dataset}` is not a supported dataset.")
     for scene in scenes:
         if not ee.logged_in():
@@ -169,8 +169,76 @@ def download(username, password, dataset, output, timeout, skip, scenes):
     ee.logout()
 
 
+@click.command()
+@click.option(
+    "--username",
+    "-u",
+    type=click.STRING,
+    help="EarthExplorer username.",
+    envvar="LANDSATXPLORE_USERNAME",
+)
+@click.option(
+    "--password",
+    "-p",
+    type=click.STRING,
+    help="EarthExplorer password.",
+    envvar="LANDSATXPLORE_PASSWORD",
+)
+@click.option("--dataset", "-d", type=click.STRING, required=False, help="Dataset")
+@click.option(
+    "--entityfile",
+    "-e",
+    required=True,
+    type=click.Path(exists=True, file_okay=True),
+    help="Entity File Name",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(exists=True, dir_okay=True),
+    default="./",
+    help="Output directory.",
+)
+@click.option(
+    "--filetype",
+    "-f",
+    required=False,
+    type=click.STRING,
+    default="bundle",
+    help="Download File Type {'bundle','band'}",
+)
+@click.option(
+    "--idfield",
+    "-i",
+    required=False,
+    type=click.STRING,
+    default="displayId",
+    help="Entity Id Type {'displayId','entityId'}",
+)
+@click.option(
+    "--timeout", "-t", type=click.INT, default=300, help="Download timeout in seconds."
+)
+@click.option("--skip", is_flag=True, default=False)
+def downloadbulk(username, password, entityfile,dataset, output, filetype,idfield,timeout, skip ): #idField
+    """Download one or several scenes."""
+    ee = EarthExplorer(username, password)
+    output_dir = os.path.abspath(output)
+    entityfile_path=os.path.abspath(entityfile)
+    if dataset and dataset.lower() not in DATASETS:
+        raise LandsatxploreError(f"`{dataset}` is not a supported dataset.")
+    if not ee.logged_in():
+        ee = EarthExplorer(username, password)
+    fname = ee.downloadbulk(
+        entityfile=entityfile_path, output_dir=output_dir, filetype=filetype,dataset=dataset, idField=idfield,timeout=timeout, skip=skip
+    )
+    if skip:
+        click.echo(fname)
+    ee.logout()
+
+
 cli.add_command(search)
 cli.add_command(download)
+cli.add_command(downloadbulk)
 
 
 if __name__ == "__main__":
